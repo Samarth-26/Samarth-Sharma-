@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>News Intelligence & Entity Analytics Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-body: #0f172a;
+            --bg-card: #1e293b;
+            --bg-card-hover: #334155;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-blue: #3b82f6;
+            --accent-cyan: #06b6d4;
+            --border-color: #334155;
+            
+            --badge-sport: #10b981;
+            --badge-politician: #ef4444;
+            --badge-author: #f59e0b;
+            --badge-location: #06b6d4;
+            --badge-actor: #ec4899;
+            --badge-business: #8b5cf6;
+            --badge-official: #64748b;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-body);
+            color: var(--text-primary);
+            padding: 30px 20px;
+            line-height: 1.5;
+        }
+
+        .container { max-width: 1400px; margin: 0 auto; }
+
+        .dashboard-header {
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 35px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .header-title h1 {
+            font-size: 28px;
+            font-weight: 700;
+            background: linear-gradient(90deg, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 6px;
+        }
+
+        .header-title p { color: var(--text-secondary); font-size: 14px; }
+
+        .meta-pill {
+            background: rgba(59, 130, 246, 0.1);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            color: #60a5fa;
+            padding: 8px 16px;
+            border-radius: 30px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .section-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 40px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.2);
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 25px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 15px;
+        }
+
+        .section-header h2 { font-size: 20px; font-weight: 600; color: var(--text-primary); }
+
+        .table-responsive { width: 100%; overflow-x: auto; }
+
+        table { width: 100%; border-collapse: collapse; text-align: left; }
+
+        th {
+            background-color: #0f172a;
+            color: var(--text-secondary);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 16px;
+            border-bottom: 2px solid var(--border-color);
+        }
+
+        td { padding: 16px; border-bottom: 1px solid var(--border-color); font-size: 14px; }
+
+        tr:hover { background-color: var(--bg-card-hover); }
+
+        .entity-name { font-weight: 600; color: var(--text-primary); }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #ffffff;
+        }
+
+        .badge-Sportsperson { background-color: var(--badge-sport); }
+        .badge-Politician { background-color: var(--badge-politician); }
+        .badge-Author { background-color: var(--badge-author); }
+        .badge-Location { background-color: var(--badge-location); }
+        .badge-Actor { background-color: var(--badge-actor); }
+        .badge-Businessman { background-color: var(--badge-business); }
+        .badge-Official, .badge-Government { background-color: var(--badge-official); }
+        .badge-Default { background-color: #64748b; }
+
+        .sub-detail { color: var(--text-secondary); font-size: 13px; }
+
+        .channel-tag {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #cbd5e1;
+        }
+
+        .datetime-tag { font-family: monospace; color: #38bdf8; font-size: 13px; }
+
+        .article-link { color: #60a5fa; text-decoration: none; font-weight: 500; }
+        .article-link:hover { color: #93c5fd; text-decoration: underline; }
+
+        .analytics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+            gap: 25px;
+        }
+
+        .channel-card {
+            background: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 22px;
+        }
+
+        .channel-card-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: #f1f5f9;
+            margin-bottom: 18px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .slot-container { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+        .slot-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 14px;
+        }
+
+        .slot-header { display: flex; justify-content: space-between; margin-bottom: 8px; }
+        .slot-title { font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-secondary); }
+        .slot-time-range { font-size: 11px; color: #64748b; }
+        .dominant-sub { font-size: 11px; color: var(--text-secondary); margin-top: 4px; }
+
+        footer {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 13px;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        /* Additive executive intelligence components; existing dashboard styles remain unchanged. */
+        .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .export-button { background: var(--accent-blue); color: #fff; border: 1px solid var(--accent-blue); border-radius: 30px; padding: 8px 16px; font: 500 13px 'Inter', sans-serif; text-decoration: none; }
+        .export-button:hover { background: var(--accent-cyan); border-color: var(--accent-cyan); }
+        .brief-copy { color: var(--text-secondary); font-size: 15px; max-width: 1000px; }
+        .brief-source { color: #60a5fa; font-size: 12px; }
+        .alert-grid, .health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; }
+        .alert-card, .health-card { background: #0f172a; border: 1px solid var(--border-color); border-radius: 10px; padding: 16px; }
+        .alert-card h3, .health-card h3 { font-size: 15px; margin-bottom: 7px; }
+        .status-banner { color: #f1f5f9; background: rgba(59,130,246,.1); border: 1px solid rgba(59,130,246,.3); padding: 10px 14px; border-radius: 8px; margin-bottom: 18px; font-size: 13px; }
+        .status-banner.degraded { border-color: var(--badge-author); color: #fcd34d; }
+        .muted-empty { color: var(--text-secondary); font-size: 14px; padding: 12px 0; }
+        .tone-Positive { color: var(--badge-sport); } .tone-Negative { color: var(--badge-politician); } .tone-Neutral { color: var(--text-secondary); }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header class="dashboard-header">
+        <div class="header-title">
+            <h1>News Entity & Channel Analytics Dashboard</h1>
+            <p>Automated NLP Intelligence Engine • Real-time RSS Ingestion & Entity Extraction</p>
+        </div>
+        <div class="header-actions">
+            <div class="meta-pill">Last Pipeline Run: 2026-07-29 09:30:48</div>
+            <a class="export-button" href="executive_daily_brief.pdf" download>Download Executive PDF</a>
+        </div>
+    </header>
+
+    <!-- EXECUTIVE BRIEF: additive section -->
+    <section class="section-card">
+        <div class="section-header"><h2>Executive Daily Brief</h2><span class="brief-source">Rule-based fallback</span></div>
+        <p class="brief-copy">Coverage focused on Ada Lovelace. The leading entity categories were Author. Channel activity was highest at The Hindu (1), NDTV (1).</p>
+    </section>
+
+    <!-- TRENDING ALERTS: additive section -->
+    <section class="section-card">
+        <div class="section-header"><h2>Trending Alerts</h2><span style="font-size: 13px; color: var(--text-secondary);">Rolling mention baseline</span></div>
+        <p class="muted-empty">No spiking or new-and-trending entities detected in this run.</p>
+    </section>
+
+    <!-- SECTION 1: Main Entity Log -->
+    <section class="section-card">
+        <div class="section-header">
+            <h2>Main Entity Intelligence Log</h2>
+            <span style="font-size: 13px; color: var(--text-secondary);">Total Extracted: 2</span>
+        </div>
+
+        <div class="table-responsive">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Public Figure (Proper Noun)</th>
+                        <th>Category</th>
+                        <th>Specific Detail & Context</th>
+                        <th>News Channel</th>
+                        <th>Exact Date & Time</th>
+                        <th>Source Article</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    
+                    
+                    
+                    <tr>
+                        <td class="entity-name">Ada Lovelace</td>
+                        <td>
+                            
+                            <span class="badge badge-Author">Author</span>
+                        </td>
+                        <td class="sub-detail">Author (Book: Test)</td>
+                        <td><span class="channel-tag">The Hindu</span></td>
+                        <td class="datetime-tag">2026-07-29 12:00:00</td>
+                        <td>
+                            <a href="a" target="_blank" class="article-link">
+                                Success
+                            </a>
+                        </td>
+                    </tr>
+                    
+                    
+                    
+                    <tr>
+                        <td class="entity-name">Ada Lovelace</td>
+                        <td>
+                            
+                            <span class="badge badge-Author">Author</span>
+                        </td>
+                        <td class="sub-detail">Author (Book: Test)</td>
+                        <td><span class="channel-tag">NDTV</span></td>
+                        <td class="datetime-tag">2026-07-29 12:00:00</td>
+                        <td>
+                            <a href="b" target="_blank" class="article-link">
+                                Concern
+                            </a>
+                        </td>
+                    </tr>
+                    
+                    
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- CROSS-OUTLET COMPARISON: additive section -->
+    <section class="section-card">
+        <div class="section-header"><h2>Cross-Outlet Coverage Comparison</h2><span style="font-size: 13px; color: var(--text-secondary);">Offline lexicon tone score</span></div>
+        <div class="table-responsive"><table><thead><tr><th>Entity</th><th>Outlet tone</th><th>Coverage signal</th></tr></thead><tbody><tr><td class="entity-name">Ada Lovelace</td><td><span class="channel-tag">NDTV: <span class="tone-Negative">Negative</span></span> <span class="channel-tag">The Hindu: <span class="tone-Positive">Positive</span></span> </td><td><span class="badge badge-Author">Divergent coverage</span></td></tr></tbody></table></div>
+    </section>
+
+    <!-- SECTION 2: Channel Analytics Dashboard -->
+    <section class="section-card">
+        <div class="section-header">
+            <h2>Channel Analytics Breakdown by Time Slot</h2>
+            <span style="font-size: 13px; color: var(--text-secondary);">4-Slot Time Window Segmentation</span>
+        </div>
+
+        <div class="analytics-grid">
+            
+            <div class="channel-card">
+                <div class="channel-card-title">NDTV</div>
+                <div class="slot-container">
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Morning</span><span class="slot-time-range">05:00-11:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Dominant: Author</div>
+                    </div>
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Afternoon</span><span class="slot-time-range">12:00-16:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Mostly Authors (1 mentions)</div>
+                    </div>
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Evening</span><span class="slot-time-range">17:00-20:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Dominant: Author</div>
+                    </div>
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Night</span><span class="slot-time-range">21:00-04:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Dominant: Author</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="channel-card">
+                <div class="channel-card-title">The Hindu</div>
+                <div class="slot-container">
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Morning</span><span class="slot-time-range">05:00-11:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Dominant: Author</div>
+                    </div>
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Afternoon</span><span class="slot-time-range">12:00-16:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Mostly Authors (1 mentions)</div>
+                    </div>
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Evening</span><span class="slot-time-range">17:00-20:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Dominant: Author</div>
+                    </div>
+                    <div class="slot-box">
+                        <div class="slot-header"><span class="slot-title">Night</span><span class="slot-time-range">21:00-04:59</span></div>
+                        <div><span class="badge badge-Author">Author</span></div>
+                        <div class="dominant-sub">Dominant: Author</div>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+    </section>
+
+    <!-- PIPELINE HEALTH: additive section -->
+    <section class="section-card">
+        <div class="section-header"><h2>Pipeline Health / SLA</h2><span style="font-size: 13px; color: var(--text-secondary);">Persisted across runs</span></div>
+        <div class="status-banner degraded">Pipeline status: Degraded</div>
+        <div class="health-grid"><div class="health-card"><h3>Times of India</h3><p class="sub-detail">Fetched: 0 / 10</p><p class="sub-detail">Success: 0.0% · Uptime: 0.0%</p></div><div class="health-card"><h3>The Hindu</h3><p class="sub-detail">Fetched: 1 / 10</p><p class="sub-detail">Success: 10.0% · Uptime: 100.0%</p></div><div class="health-card"><h3>NDTV</h3><p class="sub-detail">Fetched: 1 / 10</p><p class="sub-detail">Success: 10.0% · Uptime: 100.0%</p></div><div class="health-card"><h3>India Today</h3><p class="sub-detail">Fetched: 0 / 10</p><p class="sub-detail">Success: 0.0% · Uptime: 0.0%</p></div><div class="health-card"><h3>Indian Express</h3><p class="sub-detail">Fetched: 0 / 10</p><p class="sub-detail">Success: 0.0% · Uptime: 0.0%</p></div></div>
+    </section>
+
+    <footer>News Intelligence Engine • Powered by spaCy, Hugging Face BART NLI & Jinja2</footer>
+</div>
+
+</body>
+</html>

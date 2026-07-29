@@ -1,0 +1,624 @@
+﻿"""
+pipeline/fetcher.py
+Background RSS scraper that runs in a daemon thread.
+
+Flow:
+  1. Iterate over all RSS_FEEDS.
+  2. For each feed entry, scrape the full article text with newspaper4k
+     (falls back to RSS summary if scraping is blocked).
+  3. Save the batch to news_data.csv via csv_store.save_articles_to_csv().
+  4. Sleep for FETCH_INTERVAL_SECONDS, then repeat.
+
+Thread-safe status is exposed via get_pipeline_state() / update_pipeline_state()
+and is polled by the Flask SSE /stream/progress endpoint.
+"""
+import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+import feedparser
+from dateutil import parser as date_parser
+from newspaper import Article
+
+from config import (
+    RSS_FEEDS, ARTICLES_PER_FEED, USER_AGENT, FETCH_INTERVAL_SECONDS
+)
+from pipeline.csv_store import save_articles_to_csv
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+# â”€â”€ Pipeline state (thread-safe) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+_state_lock = threading.Lock()
+_pipeline_state: dict = {
+    "phase":            "idle",   # idle | scraping | nlp_processing | ready
+    "last_run":         None,
+    "article_count":    0,
+    "entity_count":     0,
+    "progress_message": "Initializing pipeline...",
+    "error":            None,
+}
+
+
+def get_pipeline_state() -> dict:
+    with _state_lock:
+        return dict(_pipeline_state)
+
+
+def update_pipeline_state(**kwargs) -> None:
+    with _state_lock:
+        _pipeline_state.update(kwargs)
+
+
+# â”€â”€ Datetime helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _parse_datetime(raw: str, article_dt) -> str:
+    """Normalise a publish datetime to 'YYYY-MM-DD HH:MM:SS'."""
+    if article_dt:
+        try:
+            return article_dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    if raw and raw not in ("Unknown", "", None):
+        try:
+            return date_parser.parse(raw).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# â”€â”€ Single-article scraper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _scrape_one(entry, channel_name: str) -> dict | None:
+    """
+    Download and parse a single RSS entry.
+    Returns an article dict or None if the entry has no URL.
+    Falls back to the RSS summary snippet when newspaper4k is blocked.
+    """
+    link = getattr(entry, "link", None)
+    if not link:
+        return None
+    raw_pub = getattr(entry, "published", None)
+
+    try:
+        art = Article(link, browser_user_agent=USER_AGENT)
+        art.download()
+        art.parse()
+        full_text = art.text if len(art.text) > 100 else getattr(entry, "summary", "")
+        title     = art.title or getattr(entry, "title", "Untitled")
+        dt        = _parse_datetime(raw_pub, art.publish_date)
+        print(f"  [OK] {channel_name}: {title[:65]}")
+    except Exception as exc:
+        print(f"  [FALLBACK] {channel_name}: {exc}")
+        title     = getattr(entry, "title", "Untitled")
+        full_text = f"{title}. {getattr(entry, 'summary', '')}"
+        dt        = _parse_datetime(raw_pub, None)
+
+    return {
+        "channel":        channel_name,
+        "title":          title,
+        "url":            link,
+        "exact_datetime": dt,
+        "full_text":      full_text,
+    }
+
+
+# â”€â”€ Full scrape cycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def run_scrape_cycle() -> list:
+    """
+    Fetch all RSS feeds and scrape articles in parallel.
+    Persists new articles to the CSV and returns the raw list.
+    """
+    update_pipeline_state(
+        phase="scraping",
+        progress_message="Connecting to RSS feeds...",
+    )
+    tasks   = []
+    results = []
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        for channel_name, feed_url in RSS_FEEDS.items():
+            update_pipeline_state(
+                progress_message=f"Fetching RSS: {channel_name}..."
+            )
+            print(f"\n[RSS] â†’ {channel_name}")
+            try:
+                feed    = feedparser.parse(feed_url, agent=USER_AGENT)
+                entries = feed.entries[:ARTICLES_PER_FEED]
+                for entry in entries:
+                    tasks.append(pool.submit(_scrape_one, entry, channel_name))
+            except Exception as exc:
+                print(f"[RSS ERROR] {channel_name}: {exc}")
+
+        for future in as_completed(tasks):
+            try:
+                art = future.result()
+                if art:
+                    results.append(art)
+            except Exception as exc:
+                print(f"[SCRAPE ERROR] {exc}")
+
+    new_count = save_articles_to_csv(results)
+    print(f"\n[CSV] {new_count} new articles saved (batch: {len(results)}).")
+    update_pipeline_state(
+        progress_message=f"Scraped {len(results)} articles. {new_count} new saved.",
+        article_count=len(results),
+    )
+    return results
+
+
+# â”€â”€ Daemon background loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _background_loop() -> None:
+    """Runs forever in a daemon thread, re-scraping every N seconds."""
+    print("[FETCHER] Background refresh loop started.")
+    while True:
+        try:
+            run_scrape_cycle()
+        except Exception as exc:
+            print(f"[FETCHER ERROR] {exc}")
+            update_pipeline_state(error=str(exc))
+        update_pipeline_state(last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        time.sleep(FETCH_INTERVAL_SECONDS)
+
+
+def start_background_fetcher() -> threading.Thread:
+    """Launch the background scrape loop as a daemon thread."""
+    t = threading.Thread(target=_background_loop, daemon=True, name="bg-fetcher")
+    t.start()
+    return t
+"""
+pipeline/nlp_engine.py
+Advanced NLP entity extraction with hyper-specific categorization.
+
+Design decisions:
+- Strict PERSON-only: GPE / LOC / FAC entities are completely ignored.
+- Fuzzy per-article deduplication: SequenceMatcher prevents near-identical
+  names (e.g. "Narendra Modi" vs "Modi") from appearing twice per article.
+- Keyword-based categorization: fast, interpretable, no 1.6 GB model needed.
+  Operates on the article text context, NOT just the entity name.
+- Actor movie extraction: tries spaCy WORK_OF_ART first, then regex patterns.
+- Results are cached by (normalized_name + text_fingerprint) for the lifetime
+  of the server process to avoid repeated computation on the same text.
+"""
+import re
+from difflib import SequenceMatcher
+from typing import Dict, List, Optional
+
+import spacy
+
+from config import (
+    SPACY_MODEL,
+    SPORT_KEYWORDS,
+    ACTOR_KEYWORDS,
+    MOVIE_PATTERNS,
+    POLITICAL_PARTIES,
+)
+
+# â”€â”€ spaCy model (loaded once at import time) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+print("[NLP] Loading spaCy modelâ€¦")
+try:
+    _nlp = spacy.load(SPACY_MODEL)
+except OSError:
+    raise OSError(
+        f"spaCy model '{SPACY_MODEL}' not found.\n"
+        f"Fix: python -m spacy download {SPACY_MODEL}"
+    )
+
+# â”€â”€ Classification cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+_CACHE: Dict[str, dict] = {}
+
+# Words that are never real person names
+_NOISE_WORDS = frozenset({
+    "new", "old", "said", "says", "also", "first", "second", "third",
+    "pm", "cm", "ceo", "mla", "mp", "sc", "hc", "inc", "ltd",
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "monday", "tuesday", "wednesday", "thursday", "friday",
+    "saturday", "sunday",
+})
+
+
+# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _normalize(name: str) -> str:
+    return re.sub(r"[^\w\s]", "", name.lower().strip())
+
+
+def _is_noise(name: str) -> bool:
+    """Return True if the name looks like a non-person token."""
+    parts = name.lower().split()
+    if not parts:
+        return True
+    if all(p in _NOISE_WORDS for p in parts):
+        return True
+    if all(len(p) <= 1 for p in parts):  # just initials like "A. B."
+        return True
+    if any(ch.isdigit() for ch in name):
+        return True
+    if len(parts) > 5:  # too long to be a name
+        return True
+    return False
+
+
+def _fuzzy_dup(a: str, b: str, threshold: float = 0.82) -> bool:
+    """True when two normalised names are similar enough to be the same person."""
+    return SequenceMatcher(None, a, b).ratio() >= threshold
+
+
+def _extract_movie(text: str, doc) -> Optional[str]:
+    """Best-effort movie title extraction from an article."""
+    # 1. spaCy WORK_OF_ART entity
+    for ent in doc.ents:
+        if ent.label_ == "WORK_OF_ART":
+            title = ent.text.strip()
+            if 2 <= len(title.split()) <= 7:
+                return title
+    # 2. Regex patterns
+    for pat in MOVIE_PATTERNS:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            title = (m.group(1) or "").strip()
+            if 3 <= len(title) <= 60:
+                return title
+    return None
+
+
+def _detect_sport(text_lower: str) -> str:
+    """Return the sport with the most keyword hits in the article text."""
+    scores: Dict[str, int] = {}
+    for sport, keywords in SPORT_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in text_lower)
+        if score > 0:
+            scores[sport] = score
+    return max(scores, key=scores.get) if scores else "Other Sportsperson"
+
+
+def _detect_party(text: str) -> str:
+    for party_name, pattern in POLITICAL_PARTIES:
+        if re.search(pattern, text, re.IGNORECASE):
+            return party_name
+    return "Independent / Unknown Party"
+
+
+# â”€â”€ Core classifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _classify(name: str, text: str, doc) -> dict:
+    """
+    Classify a PERSON entity using keyword heuristics on the article text.
+    Returns {category, specific_detail, movie_context}.
+    Result is cached by (normalised_name + text[:200]) key.
+    """
+    cache_key = _normalize(name) + "|" + text[:200]
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
+    text_lower = text.lower()
+
+    # â”€â”€ 1. Entertainment / cinema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    actor_score = sum(1 for kw in ACTOR_KEYWORDS if kw in text_lower)
+    if actor_score >= 2:
+        movie = _extract_movie(text, doc)
+        # Try to distinguish actor vs actress from article pronouns
+        is_actress = (
+            "actress" in text_lower
+            or " she " in text_lower
+            or "her role" in text_lower
+        )
+        result = {
+            "category":       "Actor / Entertainer",
+            "specific_detail": "Actress" if is_actress else "Actor",
+            "movie_context":   movie,
+        }
+        _CACHE[cache_key] = result
+        return result
+
+    # â”€â”€ 2. Sport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    sport_scores = {
+        sport: sum(1 for kw in kws if kw in text_lower)
+        for sport, kws in SPORT_KEYWORDS.items()
+    }
+    best_sport_score = max(sport_scores.values(), default=0)
+    if best_sport_score > 0:
+        top_sport = max(sport_scores, key=sport_scores.get)
+        result = {
+            "category":       "Sportsperson",
+            "specific_detail": top_sport,
+            "movie_context":   None,
+        }
+        _CACHE[cache_key] = result
+        return result
+
+    # â”€â”€ 3. Politician â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    pol_kws = [
+        "minister", "parliament", "lok sabha", "rajya sabha", "election",
+        "mla", " mp ", "chief minister", "president", "governor",
+        "party", "bjp", "congress", "aap", "dmk", "tmc", "vote", "poll",
+        "senator", "congressman", "cabinet",
+    ]
+    if any(kw in text_lower for kw in pol_kws):
+        party = _detect_party(text)
+        result = {
+            "category":       "Politician",
+            "specific_detail": f"Politician ({party})",
+            "movie_context":   None,
+        }
+        _CACHE[cache_key] = result
+        return result
+
+    # â”€â”€ 4. Businessman / corporate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    biz_kws = [
+        "ceo", "founder", "company", "startup", "billion", "million",
+        "business", "corporate", "market", "stock", "ipo",
+        "entrepreneur", "tata", "adani", "ambani", "reliance",
+        "infosys", "wipro", "boardroom",
+    ]
+    if any(kw in text_lower for kw in biz_kws):
+        result = {
+            "category":       "Businessman",
+            "specific_detail": "Businessman / Industry Leader",
+            "movie_context":   None,
+        }
+        _CACHE[cache_key] = result
+        return result
+
+    # â”€â”€ 5. Author / literary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    author_kws = [
+        "author", "book", "novel", "writer", "wrote", "published",
+        "literary", "fiction", "non-fiction", "autobiography", "memoir",
+    ]
+    if any(kw in text_lower for kw in author_kws):
+        result = {
+            "category":       "Author",
+            "specific_detail": "Author / Writer",
+            "movie_context":   None,
+        }
+        _CACHE[cache_key] = result
+        return result
+
+    # â”€â”€ 6. Government official / institution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    gov_kws = [
+        "ias", "ips", "judge", "court", "justice", "commissioner",
+        "secretary", "officer", "department", "ministry", "bureau",
+        "cbi", "ed", "nia", "rti", "rbi", "sebi", "nhrc",
+    ]
+    if any(kw in text_lower for kw in gov_kws):
+        result = {
+            "category":       "Government Official",
+            "specific_detail": "Government Official / Institution",
+            "movie_context":   None,
+        }
+        _CACHE[cache_key] = result
+        return result
+
+    # â”€â”€ 7. Default fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    result = {
+        "category":       "Government Official",
+        "specific_detail": "Public Figure",
+        "movie_context":   None,
+    }
+    _CACHE[cache_key] = result
+    return result
+
+
+# â”€â”€ Per-article processor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def process_article(article: dict) -> List[dict]:
+    """
+    Extract and classify all PERSON entities from a single article dict
+    (as loaded from the CSV).
+
+    Strict rules applied here:
+    - Only ent.label_ == "PERSON" passes through.
+    - Name must be â‰¥ 2 words (rejects bare surnames).
+    - Noise-word names are dropped.
+    - Per-article fuzzy deduplication prevents near-duplicate entries.
+    """
+    text = str(article.get("full_text", "")).strip()
+    if not text:
+        return []
+
+    doc            = _nlp(text[:5000])   # cap for speed
+    seen_norms: List[str] = []
+    entities: List[dict] = []
+
+    for ent in doc.ents:
+        # â”€â”€ STRICT: PERSON only â€” GPE / LOC / FAC are ignored â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if ent.label_ != "PERSON":
+            continue
+
+        clean_name = ent.text.strip()
+
+        # Must be â‰¥ 2 words
+        if len(clean_name.split()) < 2:
+            continue
+
+        # Noise filter
+        if _is_noise(clean_name):
+            continue
+
+        # Fuzzy per-article deduplication
+        norm = _normalize(clean_name)
+        if any(_fuzzy_dup(norm, s) for s in seen_norms):
+            continue
+        seen_norms.append(norm)
+
+        # Classify
+        cls = _classify(clean_name, text, doc)
+
+        entities.append({
+            "name":            clean_name,
+            "category":        cls["category"],
+            "specific_detail": cls["specific_detail"],
+            "movie_context":   cls["movie_context"],
+            "channel":         article.get("channel", "Unknown"),
+            "exact_datetime":  article.get("exact_datetime", ""),
+            "article_title":   article.get("title", ""),
+            "article_url":     article.get("url", ""),
+            "article_snippet": text[:300],
+        })
+
+    return entities
+
+
+# â”€â”€ Batch processor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def process_all_articles(articles: List[dict]) -> List[dict]:
+    """
+    Process every article from the CSV in sequence.
+    Returns the flat list of all extracted entity dicts.
+    """
+    all_entities: List[dict] = []
+    for article in articles:
+        all_entities.extend(process_article(article))
+    print(f"[NLP] Extracted {len(all_entities)} entities from {len(articles)} articles.")
+    return all_entities
+"""
+pipeline/csv_store.py
+Thread-safe CSV layer for the news article data store.
+
+Schema: channel | title | url | exact_datetime | full_text
+"""
+import csv
+import os
+import threading
+from typing import List, Dict
+
+from config import CSV_PATH, CSV_COLUMNS
+
+_csv_lock = threading.Lock()
+
+
+# â”€â”€ Internal helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _ensure_data_dir() -> None:
+    """Create the data/ directory and CSV header if they don't exist."""
+    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
+
+
+def _read_existing_urls() -> set:
+    """Return the set of URLs already stored in the CSV (no lock neededâ€”caller holds it)."""
+    urls: set = set()
+    try:
+        with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                url = row.get("url", "").strip()
+                if url:
+                    urls.add(url)
+    except Exception:
+        pass
+    return urls
+
+
+# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def save_articles_to_csv(articles: List[Dict]) -> int:
+    """
+    Append *new* articles to the CSV, deduplicating by URL.
+    Returns the count of articles actually written.
+    """
+    _ensure_data_dir()
+    with _csv_lock:
+        existing_urls = _read_existing_urls()
+        new_articles = [
+            a for a in articles
+            if a.get("url", "").strip() not in existing_urls
+        ]
+        if new_articles:
+            with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=CSV_COLUMNS, extrasaction="ignore"
+                )
+                for article in new_articles:
+                    writer.writerow(
+                        {col: str(article.get(col, "")) for col in CSV_COLUMNS}
+                    )
+    return len(new_articles)
+
+
+def load_articles_from_csv() -> List[Dict]:
+    """Return all articles stored in the CSV as a list of dicts."""
+    _ensure_data_dir()
+    articles: List[Dict] = []
+    with _csv_lock:
+        try:
+            with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    articles.append(dict(row))
+        except Exception as exc:
+            print(f"[CSV] Read error: {exc}")
+    return articles
+
+
+def get_article_count() -> int:
+    """Fast count of rows in the CSV (no full load)."""
+    _ensure_data_dir()
+    count = 0
+    with _csv_lock:
+        try:
+            with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
+                count = sum(1 for _ in csv.DictReader(f))
+        except Exception:
+            pass
+    return count
+
+
+def clear_csv() -> None:
+    """Wipe all article data and reset to an empty CSV with headers only."""
+    _ensure_data_dir()
+    with _csv_lock:
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
+    print("[CSV] Cleared.")
+# pipeline/__init__.py
+import os
+import csv
+from datetime import datetime, timedelta
+ 
+CSV_FIELDS = ["channel", "title", "url", "exact_datetime", "full_text"]
+ 
+ 
+def save_articles_to_csv(articles, path):
+    """Writes scraped articles to CSV, overwriting any previous cache."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for article in articles:
+            writer.writerow({field: article.get(field, "") for field in CSV_FIELDS})
+    print(f"[CACHE] Saved {len(articles)} articles to {path}")
+ 
+ 
+def load_articles_from_csv(path):
+    """Reads back the CSV into the same list-of-dicts shape scraper.py produces."""
+    if not os.path.exists(path):
+        return []
+    articles = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            articles.append(dict(row))
+    return articles
+ 
+ 
+def is_cache_fresh(path, max_age_minutes):
+    """True if the CSV exists and was written within the last max_age_minutes."""
+    if not os.path.exists(path):
+        return False
+    mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    return datetime.now() - mtime < timedelta(minutes=max_age_minutes)
+ 
+ 
+def cache_age_minutes(path):
+    """How old the cache file is, in minutes. Returns None if it doesn't exist."""
+    if not os.path.exists(path):
+        return None
+    mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    return (datetime.now() - mtime).total_seconds() / 60
+ 
